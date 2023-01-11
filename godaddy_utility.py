@@ -34,6 +34,7 @@ def vsmape(y_true, y_pred):
 
 
 def get_rawdata(train, test):
+    "concat train and test with labels, add dcount,county_id,state_id"
     train['istest'] = 0
     test['istest'] = 1
     raw = pd.concat((train, test)).sort_values(['cfips', 'row_id']).reset_index(drop=True)
@@ -55,40 +56,20 @@ def get_rawdata(train, test):
     return raw
 
 
-def replace_outliers(raw):
-    lag = 1  # set the lag value to 1
-
-    # 'mbd_lag_1' with the shifted values of the 'microbusiness_density' column, back-filled within each 'cfips' group
-    raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')['microbusiness_density'].shift(lag).bfill()
-
-    # 'dif' with the absolute difference between the current and lag 'microbusiness_density' values, normalized by the lag value
-    raw['dif'] = (raw['microbusiness_density'] / raw[f'mbd_lag_{lag}']).fillna(1).clip(0, None) - 1
-
-    # set the 'dif' values to 0 where the lag 'microbusiness_density' is 0
-    raw.loc[(raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 0
-    # set the 'dif' values to 1 where the current 'microbusiness_density' is
-    # positive and the lag 'microbusiness_density' is 0
-    raw.loc[(raw[f'microbusiness_density'] > 0) & (raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 1
-    # take the absolute value of the 'dif' column
-    raw['dif'] = raw['dif'].abs()
-
+def replace_outliers(raw, threshold=0.2):
     outliers = []
     cnt = 0
 
     for o in raw.cfips.unique():
-        # get the indices for rows with the current 'cfips' value
+
         indices = (raw['cfips'] == o)
-
-        # create a temporary copy of the data for the current 'cfips' value
         tmp = raw.loc[indices].copy().reset_index(drop=True)
-
         var = tmp.microbusiness_density.values.copy()
 
         # loop through the values in reverse order, starting from index 37 and ending at index 2
         for i in range(37, 2, -1):
             # calculate a threshold value as 20% of the mean of the first i values
-            thr = 0.20 * np.mean(var[:i])
-
+            thr = threshold * np.mean(var[:i])
             # calculate the absolute difference between the current and previous values
             difa = abs(var[i] - var[i - 1])
 
@@ -101,18 +82,44 @@ def replace_outliers(raw):
         # set the first value to be 99% of the second value
         var[0] = var[1] * 0.99
 
-        # update the 'microbusiness_density' values in the original data with the
-        # modified values for the current 'cfips' value
         raw.loc[indices, 'microbusiness_density'] = var
 
     outliers = np.unique(outliers)
     print(f"number of unique cfips with outliers:{len(outliers)}, total number of outliers:{cnt}")
     return raw
 
+
+def abs_dif(raw):
+    "create abs dif column"
+    lag = 1
+
+    # Create a new column in the raw dataframe that is the microbusiness density value of the previous month
+    # (shifted by lag number of periods) for each cfips. Use backfill (bfill) to fill in the first value for
+    # each cfips with the value from the second row.
+    raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')['microbusiness_density'].shift(lag).bfill()
+
+    # Create a new column in the raw dataframe that is the difference between the current month's
+    # microbusiness density and the previous month's microbusiness density, as a percentage.
+    # Fill missing values with 1 and clip values between 0 and infinity.
+    raw['dif'] = (raw['microbusiness_density'] / raw[f'mbd_lag_{lag}']).fillna(1).clip(0, None) - 1
+
+    # Replace all 0 values in the new 'dif' column with 0.
+    raw.loc[(raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 0
+
+    # Replace all values in the new 'dif' column that are positive and have a corresponding value of 0 in
+    # the previous month's 'microbusiness_density' column with 1.
+    raw.loc[(raw[f'microbusiness_density'] > 0) & (raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 1
+
+    # Take the absolute value of all values in the new 'dif' column.
+    raw['dif'] = raw['dif'].abs()
+    return raw
+
+
 # convert target
 
 
 def new_target(raw):
+    "convert target variable"
     # same as raw.microbusiness_density.pct_change(1)
     raw['target'] = raw.groupby('cfips')['microbusiness_density'].shift(-1)
     raw['target'] = raw['target'] / raw['microbusiness_density'] - 1
@@ -123,6 +130,23 @@ def new_target(raw):
     # Set the target value for rows with cfips value of 48269 to 0
     raw.loc[raw['cfips'] == 48269, 'target'] = 0.0
     return raw
+
+
+def lastactive(raw):
+    "Create a new column in the dataframe called 'lastactive' at dcount 28, for within trainset train/valid split."
+
+    raw['lastactive'] = raw.groupby('cfips')['active'].transform('last')
+
+    # Select rows from the dataframe where the 'dcount' column is equal to 28 == 2021-12-1.
+    # and group the resulting dataframe by the 'cfips' column
+    # Apply the 'last()' function to the 'microbusiness_density' column and store the resulting Series in 'dt'
+    dt = raw.loc[raw.dcount == 28].groupby('cfips')['microbusiness_density'].agg('last')
+
+    # Create a new column in the dataframe called 'lasttarget' by mapping the 'cfips' column to the 'dt' Series
+    raw['lasttarget'] = raw['cfips'].map(dt)
+
+    return raw
+
 
 # feature engineering
 
