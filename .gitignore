@@ -1,5 +1,7 @@
 data
+__pycache__
 .ipython*
 *cache
 *.csv
+tags
 

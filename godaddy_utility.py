@@ -1,1 +1,145 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"pygments_lexer":"ipython3","nbconvert_exporter":"python","version":"3.6.4","file_extension":".py","codemirror_mode":{"name":"ipython","version":3},"name":"python","mimetype":"text/x-python"}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"import numpy as np  \nimport pandas as pd \n\n## score functions\ndef smape(y_true, y_pred):\n    smap = np.zeros(len(y_true))\n    num = np.abs(y_true - y_pred)\n    dem = ((np.abs(y_true) + np.abs(y_pred)) / 2)\n    \n    pos_ind = (y_true!=0)|(y_pred!=0)\n    \n    smap[pos_ind] = num[pos_ind] / dem[pos_ind]\n    return 100 * np.mean(smap)\n\n\n# define the vsmape function which calculates and returns the \n# element-wise SMAPE values of y_true and y_pred in an array\ndef vsmape(y_true, y_pred):\n    # create an array to store the SMAPE values\n    smap = np.zeros(len(y_true))\n    \n    num = np.abs(y_true - y_pred)\n    dem = ((np.abs(y_true) + np.abs(y_pred)) / 2)\n    \n    \n    pos_ind = (y_true!=0)|(y_pred!=0)\n    smap[pos_ind] = num[pos_ind] / dem[pos_ind]\n\n    return 100 * smap\n\n## data preprocessing\n# preprocessing\ndef get_rawdata(train,test):\n    train['istest'] = 0\n    test['istest'] = 1\n    raw = pd.concat((train, test)).sort_values(['cfips','row_id']).reset_index(drop=True)\n\n    raw['first_day_of_month'] = pd.to_datetime(raw[\"first_day_of_month\"])\n    raw['county'] = raw.groupby('cfips')['county'].ffill()\n    raw['state'] = raw.groupby('cfips')['state'].ffill()\n    raw[\"year\"] = raw[\"first_day_of_month\"].dt.year\n\n    raw[\"month\"] = raw[\"first_day_of_month\"].dt.month\n\n    #date ids in each county\n    raw[\"dcount\"] = raw.groupby(['cfips'])['row_id'].cumcount()\n\n    raw['county_i'] = (raw['county'] + raw['state']).factorize()[0]\n\n    #encode the object as an enumerated type or categorical variable\n    raw['state_i'] = raw['state'].factorize()[0] \n    return raw\n\ndef replace_outliers(raw):\n    lag = 1  # set the lag value to 1\n\n    # 'mbd_lag_1' with the shifted values of the 'microbusiness_density' column, back-filled within each 'cfips' group\n    raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')['microbusiness_density'].shift(lag).bfill()\n\n    # 'dif' with the absolute difference between the current and lag 'microbusiness_density' values, normalized by the lag value\n    raw['dif'] = (raw['microbusiness_density'] / raw[f'mbd_lag_{lag}']).fillna(1).clip(0, None) - 1\n\n    # set the 'dif' values to 0 where the lag 'microbusiness_density' is 0\n    raw.loc[(raw[f'mbd_lag_{lag}']==0), 'dif'] = 0\n    # set the 'dif' values to 1 where the current 'microbusiness_density' is positive and the lag 'microbusiness_density' is 0\n    raw.loc[(raw[f'microbusiness_density']>0) & (raw[f'mbd_lag_{lag}']==0), 'dif'] = 1\n    # take the absolute value of the 'dif' column\n    raw['dif'] = raw['dif'].abs()\n\n\n    outliers = []  \n    cnt = 0 \n\n    for o in raw.cfips.unique():\n        # get the indices for rows with the current 'cfips' value\n        indices = (raw['cfips']==o)\n\n        # create a temporary copy of the data for the current 'cfips' value\n        tmp = raw.loc[indices].copy().reset_index(drop=True)\n\n        var = tmp.microbusiness_density.values.copy()\n\n        # loop through the values in reverse order, starting from index 37 and ending at index 2\n        for i in range(37, 2, -1):\n            # calculate a threshold value as 20% of the mean of the first i values\n            thr = 0.20*np.mean(var[:i])\n\n            # calculate the absolute difference between the current and previous values\n            difa = abs(var[i]-var[i-1])\n\n            # if the difference is greater than or equal to the threshold\n            if (difa>=thr):\n                var[:i] *= (var[i]/var[i-1])\n                outliers.append(o)\n                cnt+=1\n\n        # set the first value to be 99% of the second value\n        var[0] = var[1]*0.99\n\n        # update the 'microbusiness_density' values in the original data with the modified values for the current 'cfips' value\n        raw.loc[indices, 'microbusiness_density'] = var\n\n    outliers = np.unique(outliers)\n    print(f\"number of unique cfips with outliers:{len(outliers)}, total number of outliers:{cnt}\")\n    return raw\n\n## convert target\ndef new_target(raw):\n    # same as raw.microbusiness_density.pct_change(1)\n    raw['target'] = raw.groupby('cfips')['microbusiness_density'].shift(-1)\n    raw['target'] = raw['target']/raw['microbusiness_density'] - 1\n\n    # Set the target value for rows with cfips value of 28055 to 0\n    raw.loc[raw['cfips']==28055, 'target'] = 0.0\n\n    # Set the target value for rows with cfips value of 48269 to 0\n    raw.loc[raw['cfips']==48269, 'target'] = 0.0\n    return raw\n\n## feature engineering\ndef build_features(raw, target='microbusiness_density', target_act='active_tmp', lags = 6):\n    feats = []\n    for lag in range(1, lags):\n        raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')[target].shift(lag)\n        raw[f'act_lag_{lag}'] = raw.groupby('cfips')[target_act].diff(lag)\n        feats.append(f'mbd_lag_{lag}')\n        feats.append(f'act_lag_{lag}')\n        \n    lag = 1\n    for window in [2, 4, 6]:\n        raw[f'mbd_rollmea{window}_{lag}'] = raw.groupby('cfips')[f'mbd_lag_{lag}'].transform(lambda s: s.rolling(window, min_periods=1).sum())        \n        #raw[f'mbd_rollmea{window}_{lag}'] = raw[f'mbd_lag_{lag}'] - raw[f'mbd_rollmea{window}_{lag}']\n        feats.append(f'mbd_rollmea{window}_{lag}')\n        \n    return raw, feats","metadata":{"_uuid":"93bac01d-9859-4599-9ff1-f482c7e1f63b","_cell_guid":"1f8a2518-2238-45b2-977b-c464ee689724","collapsed":false,"jupyter":{"outputs_hidden":false},"trusted":true},"execution_count":null,"outputs":[]}]}
+import numpy as np
+import pandas as pd
+
+# score functions
+
+
+def smape(y_true, y_pred):
+    smap = np.zeros(len(y_true))
+    num = np.abs(y_true - y_pred)
+    dem = ((np.abs(y_true) + np.abs(y_pred)) / 2)
+
+    pos_ind = (y_true != 0) | (y_pred != 0)
+
+    smap[pos_ind] = num[pos_ind] / dem[pos_ind]
+    return 100 * np.mean(smap)
+
+
+# define the vsmape function which calculates and returns the
+# element-wise SMAPE values of y_true and y_pred in an array
+def vsmape(y_true, y_pred):
+    # create an array to store the SMAPE values
+    smap = np.zeros(len(y_true))
+
+    num = np.abs(y_true - y_pred)
+    dem = ((np.abs(y_true) + np.abs(y_pred)) / 2)
+
+    pos_ind = (y_true != 0) | (y_pred != 0)
+    smap[pos_ind] = num[pos_ind] / dem[pos_ind]
+
+    return 100 * smap
+
+# data preprocessing
+# preprocessing
+
+
+def get_rawdata(train, test):
+    train['istest'] = 0
+    test['istest'] = 1
+    raw = pd.concat((train, test)).sort_values(['cfips', 'row_id']).reset_index(drop=True)
+
+    raw['first_day_of_month'] = pd.to_datetime(raw["first_day_of_month"])
+    raw['county'] = raw.groupby('cfips')['county'].ffill()
+    raw['state'] = raw.groupby('cfips')['state'].ffill()
+    raw["year"] = raw["first_day_of_month"].dt.year
+
+    raw["month"] = raw["first_day_of_month"].dt.month
+
+    # date ids in each county
+    raw["dcount"] = raw.groupby(['cfips'])['row_id'].cumcount()
+
+    raw['county_i'] = (raw['county'] + raw['state']).factorize()[0]
+
+    # encode the object as an enumerated type or categorical variable
+    raw['state_i'] = raw['state'].factorize()[0]
+    return raw
+
+
+def replace_outliers(raw):
+    lag = 1  # set the lag value to 1
+
+    # 'mbd_lag_1' with the shifted values of the 'microbusiness_density' column, back-filled within each 'cfips' group
+    raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')['microbusiness_density'].shift(lag).bfill()
+
+    # 'dif' with the absolute difference between the current and lag 'microbusiness_density' values, normalized by the lag value
+    raw['dif'] = (raw['microbusiness_density'] / raw[f'mbd_lag_{lag}']).fillna(1).clip(0, None) - 1
+
+    # set the 'dif' values to 0 where the lag 'microbusiness_density' is 0
+    raw.loc[(raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 0
+    # set the 'dif' values to 1 where the current 'microbusiness_density' is
+    # positive and the lag 'microbusiness_density' is 0
+    raw.loc[(raw[f'microbusiness_density'] > 0) & (raw[f'mbd_lag_{lag}'] == 0), 'dif'] = 1
+    # take the absolute value of the 'dif' column
+    raw['dif'] = raw['dif'].abs()
+
+    outliers = []
+    cnt = 0
+
+    for o in raw.cfips.unique():
+        # get the indices for rows with the current 'cfips' value
+        indices = (raw['cfips'] == o)
+
+        # create a temporary copy of the data for the current 'cfips' value
+        tmp = raw.loc[indices].copy().reset_index(drop=True)
+
+        var = tmp.microbusiness_density.values.copy()
+
+        # loop through the values in reverse order, starting from index 37 and ending at index 2
+        for i in range(37, 2, -1):
+            # calculate a threshold value as 20% of the mean of the first i values
+            thr = 0.20 * np.mean(var[:i])
+
+            # calculate the absolute difference between the current and previous values
+            difa = abs(var[i] - var[i - 1])
+
+            # if the difference is greater than or equal to the threshold
+            if (difa >= thr):
+                var[:i] *= (var[i] / var[i - 1])
+                outliers.append(o)
+                cnt += 1
+
+        # set the first value to be 99% of the second value
+        var[0] = var[1] * 0.99
+
+        # update the 'microbusiness_density' values in the original data with the
+        # modified values for the current 'cfips' value
+        raw.loc[indices, 'microbusiness_density'] = var
+
+    outliers = np.unique(outliers)
+    print(f"number of unique cfips with outliers:{len(outliers)}, total number of outliers:{cnt}")
+    return raw
+
+# convert target
+
+
+def new_target(raw):
+    # same as raw.microbusiness_density.pct_change(1)
+    raw['target'] = raw.groupby('cfips')['microbusiness_density'].shift(-1)
+    raw['target'] = raw['target'] / raw['microbusiness_density'] - 1
+
+    # Set the target value for rows with cfips value of 28055 to 0
+    raw.loc[raw['cfips'] == 28055, 'target'] = 0.0
+
+    # Set the target value for rows with cfips value of 48269 to 0
+    raw.loc[raw['cfips'] == 48269, 'target'] = 0.0
+    return raw
+
+# feature engineering
+
+
+def build_features(raw, target='microbusiness_density', target_act='active_tmp', lags=6):
+    feats = []
+    for lag in range(1, lags):
+        raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')[target].shift(lag)
+        raw[f'act_lag_{lag}'] = raw.groupby('cfips')[target_act].diff(lag)
+        feats.append(f'mbd_lag_{lag}')
+        feats.append(f'act_lag_{lag}')
+
+    lag = 1
+    for window in [2, 4, 6]:
+        raw[f'mbd_rollmea{window}_{lag}'] = raw.groupby('cfips')[f'mbd_lag_{lag}'].transform(
+            lambda s: s.rolling(window, min_periods=1).sum())
+        # raw[f'mbd_rollmea{window}_{lag}'] = raw[f'mbd_lag_{lag}'] - raw[f'mbd_rollmea{window}_{lag}']
+        feats.append(f'mbd_rollmea{window}_{lag}')
+
+    return raw, feats
