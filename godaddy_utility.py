@@ -152,6 +152,7 @@ def lastactive(raw):
 
 
 def build_features(raw, target='microbusiness_density', target_act='active_tmp', lags=6):
+    "feature engineering"
     feats = []
     for lag in range(1, lags):
         raw[f'mbd_lag_{lag}'] = raw.groupby('cfips')[target].shift(lag)
